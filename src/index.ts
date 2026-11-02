@@ -148,7 +148,12 @@ async function evaluate(
   const classification = classify(event.action, event.resources, {
     projectDir: deps.allowInProjectEdits ? projectDir : undefined,
   });
-  log.logJSON("classification", { ...classification, effect: event.effect });
+  log.logJSON("classification", {
+    ...classification,
+    effect: event.effect,
+    action: event.action,
+    resources: event.resources.map((resource) => resource.slice(0, 200)),
+  });
 
   if (classification.tier === "auto-deny") {
     deny(event, classification.reason, log);
