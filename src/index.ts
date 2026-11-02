@@ -4,6 +4,12 @@ import { classify } from "./tiers.js";
 import { recordDecision } from "./state.js";
 import { defaultPolicy, type PolicyOptions, type ReviewPolicy } from "./policy.js";
 import {
+  configDecision,
+  createConfigRuleLoader,
+  type ConfigDecision,
+  type ConfigRuleLoader,
+} from "./config-rules.js";
+import {
   parseModelOption,
   providerFromMessages,
   selectReviewerModel,
@@ -45,7 +51,7 @@ export default Plugin.define({
     const options = ctx.options as {
       model?: unknown;
       review?: "all" | "prompts";
-    } & PolicyOptions & { allowInProjectEdits?: boolean };
+    } & PolicyOptions & { allowInProjectEdits?: boolean; inheritConfigRules?: unknown };
     let reviewerModel: ModelOption | undefined;
     try {
       reviewerModel = parseModelOption(options.model);
@@ -56,10 +62,19 @@ export default Plugin.define({
     const reviewScope = options.review === "prompts" ? "prompts" : "all";
     const policy = defaultPolicy(options);
     const allowInProjectEdits = options.allowInProjectEdits !== false;
+    if (options.inheritConfigRules !== undefined && typeof options.inheritConfigRules !== "boolean") {
+      const message = 'opencode-auto-mode: "inheritConfigRules" must be true or false';
+      log.log(`invalid options: ${message}`);
+      throw new Error(message);
+    }
+    const configRules =
+      options.inheritConfigRules === false
+        ? undefined
+        : createConfigRuleLoader((message) => log.log(message));
 
     const permissionRegistration = await ctx.permission.hook("evaluate", async (event) => {
       try {
-        await evaluate(ctx, event, { reviewerModel, reviewScope, policy, allowInProjectEdits }, log);
+        await evaluate(ctx, event, { reviewerModel, reviewScope, policy, allowInProjectEdits, configRules }, log);
       } catch (err) {
         log.logJSON("hook error", { error: String(err) });
         throw err;
@@ -95,6 +110,7 @@ interface EvaluateDeps {
   reviewScope: "all" | "prompts";
   policy: ReviewPolicy;
   allowInProjectEdits: boolean;
+  configRules: ConfigRuleLoader | undefined;
 }
 
 async function evaluate(
@@ -104,6 +120,31 @@ async function evaluate(
   log: ReturnType<typeof createLogger>,
 ): Promise<void> {
   const projectDir = await projectDirFor(ctx, event.sessionID, log);
+
+  // Precedence: config deny > config ask > config allow > built-in tiers > reviewer.
+  const configVerdict = configVerdictFor(deps, projectDir, event, log);
+  if (configVerdict?.effect === "deny") {
+    // Not routed through deny(): the denial backstop must never soften an
+    // explicit rule into a prompt.
+    log.logJSON("config deny", { action: event.action, resources: event.resources });
+    event.effect = "deny";
+    event.message = withDenySuffix(configVerdict.reason);
+    return;
+  }
+  if (configVerdict?.effect === "ask") {
+    // Leave the host's verdict alone: the plugin must not approve this, but it
+    // also must not override a saved approval the user gave on purpose.
+    log.logJSON("config ask", { action: event.action, resources: event.resources, effect: event.effect });
+    return;
+  }
+  // Only skip review when the host already allows: if it says ask, our
+  // reading of the config disagrees with it, so stay on the safe path.
+  if (configVerdict?.effect === "allow" && event.effect === "allow") {
+    log.logJSON("config allow", { action: event.action, resources: event.resources });
+    event.message = `auto-approved: ${configVerdict.reason}`;
+    return;
+  }
+
   const classification = classify(event.action, event.resources, {
     projectDir: deps.allowInProjectEdits ? projectDir : undefined,
   });
@@ -125,6 +166,21 @@ async function evaluate(
   if (deps.reviewScope === "prompts" && event.effect !== "ask") return;
 
   await reviewWithLLM(ctx, event, deps, projectDir, log);
+}
+
+function configVerdictFor(
+  deps: EvaluateDeps,
+  projectDir: string | undefined,
+  event: Evaluation,
+  log: ReturnType<typeof createLogger>,
+): ConfigDecision | undefined {
+  if (!deps.configRules) return undefined;
+  try {
+    return configDecision(deps.configRules.load(projectDir), event.action, event.resources);
+  } catch (err) {
+    log.log(`config rule evaluation failed: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
 }
 
 interface Evaluation {
