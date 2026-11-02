@@ -61,6 +61,47 @@ function fileTargets(resources: readonly string[]): string[] {
   return resources.filter((resource) => typeof resource === "string" && resource.length > 0);
 }
 
+function classifyShellCommand(command: string): Classification {
+  if (!command) return { tier: "auto-allow", reason: "empty command" };
+
+  for (const pattern of AUTO_BLOCKED_SHELL) {
+    if (pattern.test(command)) {
+      return {
+        tier: "auto-deny",
+        reason: `matches dangerous pattern: ${pattern.source}`,
+      };
+    }
+  }
+
+  if (hasShellMetacharacters(command)) {
+    return { tier: "review", reason: "chained or redirected command evaluated as one action" };
+  }
+
+  for (const pattern of AUTO_ALLOWED_SHELL) {
+    if (pattern.test(command)) {
+      return { tier: "auto-allow", reason: "safe read-only command" };
+    }
+  }
+
+  return { tier: "review", reason: "unrecognized command" };
+}
+
+// OpenCode splits a compound shell call (`a; b`, `a | b`) into one resource per
+// sub-command, so every one of them has to be safe. The strictest tier wins:
+// auto-deny, then review, then auto-allow.
+function classifyShellResources(resources: readonly string[]): Classification {
+  if (resources.length === 0) return classifyShellCommand("");
+
+  const results = resources.map((command) => classifyShellCommand(command));
+  const denied = results.find((result) => result.tier === "auto-deny");
+  if (denied) return denied;
+
+  const needsReview = results.find((result) => result.tier === "review");
+  if (needsReview) return needsReview;
+
+  return results[0];
+}
+
 export function classify(
   action: string,
   resources: readonly string[],
@@ -70,31 +111,7 @@ export function classify(
     return { tier: "review", reason: `subagent delegation ('${action}') needs intent review` };
   }
 
-  if (action === "shell") {
-    const command = resources[0] ?? "";
-    if (!command) return { tier: "auto-allow", reason: "empty command" };
-
-    for (const pattern of AUTO_BLOCKED_SHELL) {
-      if (pattern.test(command)) {
-        return {
-          tier: "auto-deny",
-          reason: `matches dangerous pattern: ${pattern.source}`,
-        };
-      }
-    }
-
-    if (hasShellMetacharacters(command)) {
-      return { tier: "review", reason: "chained or redirected command evaluated as one action" };
-    }
-
-    for (const pattern of AUTO_ALLOWED_SHELL) {
-      if (pattern.test(command)) {
-        return { tier: "auto-allow", reason: "safe read-only command" };
-      }
-    }
-
-    return { tier: "review", reason: "unrecognized command" };
-  }
+  if (action === "shell") return classifyShellResources(resources);
 
   if (SAFE_TOOL_ACTIONS.has(action)) {
     return { tier: "auto-allow", reason: `safe ${action} operation` };

