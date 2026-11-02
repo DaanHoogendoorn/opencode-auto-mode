@@ -3,6 +3,13 @@ import { createLogger } from "./logger.js";
 import { classify } from "./tiers.js";
 import { recordDecision } from "./state.js";
 import { defaultPolicy, type PolicyOptions, type ReviewPolicy } from "./policy.js";
+import {
+  parseModelOption,
+  providerFromMessages,
+  selectReviewerModel,
+  type ModelOption,
+  type ReviewerModel,
+} from "./model.js";
 import { extractTranscript } from "./transcript.js";
 import { scanResultContent, withInjectionWarning } from "./probe.js";
 import {
@@ -20,13 +27,14 @@ const MAX_REVIEW_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 1_000;
 const MAX_CONSECUTIVE_DENIALS = 3;
 const MAX_TOTAL_DENIALS = 20;
-
-type ReviewerModel = { id: string; providerID: string; variant?: string };
+// The user can switch models mid-session, so the provider is re-read after this.
+const PROVIDER_CACHE_TTL_MS = 30_000;
 
 let reviewCounter = 0;
 
 const denialCounts = new Map<string, { consecutive: number; total: number }>();
 const projectDirCache = new Map<string, string | undefined>();
+const providerCache = new Map<string, { providerID: string | undefined; at: number }>();
 
 export default Plugin.define({
   id: "opencode-auto-mode",
@@ -35,10 +43,16 @@ export default Plugin.define({
     log.log("=== plugin loaded (permission.evaluate hook) ===");
 
     const options = ctx.options as {
-      model?: ReviewerModel;
+      model?: unknown;
       review?: "all" | "prompts";
     } & PolicyOptions & { allowInProjectEdits?: boolean };
-    const reviewerModel = options.model;
+    let reviewerModel: ModelOption | undefined;
+    try {
+      reviewerModel = parseModelOption(options.model);
+    } catch (err) {
+      log.log(`invalid options: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
     const reviewScope = options.review === "prompts" ? "prompts" : "all";
     const policy = defaultPolicy(options);
     const allowInProjectEdits = options.allowInProjectEdits !== false;
@@ -77,7 +91,7 @@ export default Plugin.define({
 });
 
 interface EvaluateDeps {
-  reviewerModel: ReviewerModel | undefined;
+  reviewerModel: ModelOption | undefined;
   reviewScope: "all" | "prompts";
   policy: ReviewPolicy;
   allowInProjectEdits: boolean;
@@ -127,9 +141,39 @@ interface PluginContext {
     text(input: { prompt: string; model?: ReviewerModel | null }): Promise<{ text: string }>;
   };
   session: {
-    get(input: { sessionID: string }): Promise<{ location?: { directory?: string } }>;
+    get(input: {
+      sessionID: string;
+    }): Promise<{ location?: { directory?: string }; model?: { providerID?: string } }>;
     context(input: { sessionID: string }): Promise<unknown[]>;
   };
+}
+
+// The evaluate event carries no model/provider, so look it up from the session.
+// Only called when the model option has per-provider entries; failures are
+// non-fatal and resolve to undefined (→ "default" model).
+async function providerFor(
+  ctx: PluginContext,
+  sessionID: string,
+  log: ReturnType<typeof createLogger>,
+): Promise<string | undefined> {
+  const cached = providerCache.get(sessionID);
+  if (cached && Date.now() - cached.at < PROVIDER_CACHE_TTL_MS) return cached.providerID;
+
+  let providerID: string | undefined;
+  try {
+    const info = await withTimeout(ctx.session.get({ sessionID }), CONTEXT_TIMEOUT_MS);
+    providerID = info?.model?.providerID || undefined;
+    if (!providerID) {
+      const messages = await withTimeout(ctx.session.context({ sessionID }), CONTEXT_TIMEOUT_MS);
+      providerID = providerFromMessages(messages);
+    }
+  } catch (err) {
+    log.log(`provider lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+    return cached?.providerID;
+  }
+
+  providerCache.set(sessionID, { providerID, at: Date.now() });
+  return providerID;
 }
 
 async function projectDirFor(
@@ -190,7 +234,12 @@ async function reviewWithLLM(
     isDelegation: event.action === "task" || event.action === "subagent",
   };
 
-  const stage1 = await attemptReview(ctx, buildStage1Prompt(req, deps.policy), deps.reviewerModel, log);
+  const hasProviderEntries = Object.keys(deps.reviewerModel?.byProvider ?? {}).length > 0;
+  const mainProvider = hasProviderEntries ? await providerFor(ctx, event.sessionID, log) : undefined;
+  const reviewerModel = selectReviewerModel(deps.reviewerModel, mainProvider);
+  log.logJSON("reviewer model", { mainProvider, reviewerModel });
+
+  const stage1 = await attemptReview(ctx, buildStage1Prompt(req, deps.policy), reviewerModel, log);
   if (!stage1) return escalate(event, reviewID, "auto-mode reviewer failed — please decide yourself", log);
 
   const triage = parseStage1(stage1.text);
@@ -203,7 +252,7 @@ async function reviewWithLLM(
     return;
   }
 
-  const result = await attemptReview(ctx, buildStage2Prompt(req, deps.policy), deps.reviewerModel, log);
+  const result = await attemptReview(ctx, buildStage2Prompt(req, deps.policy), reviewerModel, log);
   if (!result) return escalate(event, reviewID, "auto-mode reviewer failed — please decide yourself", log);
 
   log.logJSON("reviewer response", result);
