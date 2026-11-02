@@ -41,7 +41,7 @@ const AUTO_BLOCKED_SHELL = [
   /\bchmod\s+777\b/,
 ];
 
-function hasShellMetacharacters(command: string): boolean {
+export function hasShellMetacharacters(command: string): boolean {
   if (/`|\$\(/.test(command)) return true;
   if (/>>?|2>&1|2>/.test(command)) return true;
   if (/<(?![a-z0-9_-]+=)/i.test(command)) return true;
